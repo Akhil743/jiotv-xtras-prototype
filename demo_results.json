@@ -1,0 +1,90 @@
+{
+  "video_name": "DEMO_mix2_malhari_gully_rrr_dangal_chaiyya.mp4",
+  "total_duration": 63.02322,
+  "analysis_mode": "hybrid",
+  "clip_duration": 10,
+  "clip_overlap": 2,
+  "segments": [
+    {
+      "clip_id": 0,
+      "start_time": 0.0,
+      "end_time": 18.0,
+      "duration": 18.0,
+      "category": "musical",
+      "confidence": 0.691,
+      "scores": {
+        "musical": 0.552,
+        "dialogue": 0.138,
+        "action": 0.304
+      },
+      "features": {
+        "rms_mean": 0.22348,
+        "rms_std": 0.03662,
+        "centroid_mean": 2417.2,
+        "centroid_std": 268.4,
+        "zcr_mean": 0.14067,
+        "harmonic_ratio": 0.658,
+        "tempo": 117.5,
+        "beat_strength": 1.9,
+        "bandwidth_mean": 2293.1,
+        "rolloff_mean": 4660.1,
+        "mfcc_variance": 90.457
+      },
+      "description": "[Hybrid] VLM: musical (67%) + Audio: musical (55%)"
+    },
+    {
+      "clip_id": 1,
+      "start_time": 16.0,
+      "end_time": 42.0,
+      "duration": 26.0,
+      "category": "dialogue",
+      "confidence": 0.601,
+      "scores": {
+        "musical": 0.433,
+        "dialogue": 0.325,
+        "action": 0.238
+      },
+      "features": {
+        "rms_mean": 0.21257,
+        "rms_std": 0.11187,
+        "centroid_mean": 2186.2,
+        "centroid_std": 635.2,
+        "zcr_mean": 0.10017,
+        "harmonic_ratio": 0.614,
+        "tempo": 152.0,
+        "beat_strength": 2.2,
+        "bandwidth_mean": 2198.4,
+        "rolloff_mean": 4198.1,
+        "mfcc_variance": 744.849
+      },
+      "description": "[Hybrid] VLM: dialogue (67%) + Audio: musical (43%)"
+    },
+    {
+      "clip_id": 2,
+      "start_time": 40.0,
+      "end_time": 63.02,
+      "duration": 23.02,
+      "category": "musical",
+      "confidence": 0.672,
+      "scores": {
+        "musical": 0.463,
+        "dialogue": 0.347,
+        "action": 0.185
+      },
+      "features": {
+        "rms_mean": 0.0919,
+        "rms_std": 0.0647,
+        "centroid_mean": 1774.8,
+        "centroid_std": 372.7,
+        "zcr_mean": 0.09428,
+        "harmonic_ratio": 0.705,
+        "tempo": 161.5,
+        "beat_strength": 2.5,
+        "bandwidth_mean": 1904.3,
+        "rolloff_mean": 3369.6,
+        "mfcc_variance": 559.831
+      },
+      "description": "Music detected \u2014 tempo 161 BPM, harmonic ratio 0.71, beat strength 2.5/s"
+    }
+  ]
+}
