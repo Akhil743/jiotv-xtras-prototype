@@ -2,7 +2,7 @@
 
 A simplified, working proof-of-concept of the **JioTV+ Xtras** contextual overlay feature — an Amazon X-Ray-style experience that enriches passive video viewing with real-time AI-detected content metadata.
 
-> **[Live Demo](https://jiotv-xtras-prototype.streamlit.app)** · **[Case Study](https://akhil743.github.io/akhil-portfolio-website/portfolio/jiotv-xtras.html)**
+> **[Live Demo](https://jiotv-xtras-prototype-exo33ekezeaaycvdgdehse.streamlit.app)** · **[Case Study](https://akhil743.github.io/akhil-portfolio-website/portfolio/jiotv-xtras.html)**
 
 ---
 
@@ -60,7 +60,7 @@ flowchart LR
 
 ### Live Demo (Recommended)
 
-Visit the **[Streamlit Cloud deployment](https://jiotv-xtras-prototype.streamlit.app)** — check "Use pre-cached demo results" to see the classifier in action immediately.
+Visit the **[Streamlit Cloud deployment](https://jiotv-xtras-prototype-exo33ekezeaaycvdgdehse.streamlit.app)** — check "Use pre-cached demo results" to see the classifier in action immediately.
 
 ### Run Locally
 
