@@ -1,0 +1,31 @@
+# Streamlit Community Cloud puts apps to sleep after a period without visitors.
+# This visits the demo every 6 hours so it is awake when someone opens it.
+name: Keep demo awake
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-save --no-audit --no-fund puppeteer-core@23.11.1
+      - run: node scripts/keep-awake.mjs
+      # GitHub disables scheduled workflows after 60 days without repo activity;
+      # re-enabling through the API keeps this one running without dummy commits.
+      - name: Keep this workflow enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/keep-awake.yml/enable"

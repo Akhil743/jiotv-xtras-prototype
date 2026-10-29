@@ -7,189 +7,232 @@ video content using multi-modal AI — the core detection pipeline that powers
 an Amazon X-Ray-style viewing experience.
 
 Pipeline:
-  1. VLM-first architecture for multi-modal temporal segmentation
-  2. Audio analysis pipeline (librosa) for music/action/dialogue detection
-  3. Confidence-based routing (auto-tag / QA review / human annotator)
-  4. Color-coded timeline with segment navigation
+  1. Video is cut into overlapping clips
+  2. Audio analysis (librosa) scores musical / dialogue / action
+  3. Optional vision-language model (Ollama) labels sampled frames
+  4. Hybrid fusion of both signals, then adjacent clips with the same label merge
+  5. Confidence-based routing (auto-tag / QA review / human annotator)
+
+The page opens on a pre-computed demo run (demo_results.json) so it needs no
+video processing; "Analyse your own clip" runs the live pipeline.
 """
 
-import streamlit as st
-import tempfile
-import os
+import html
 import json
+import os
+import re
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
+import streamlit as st
+from PIL import Image, ImageDraw
+
+CASE_STUDY_URL = "https://akhilrajs.com/portfolio/jiotv-xtras"
+SOURCE_URL = "https://github.com/Akhil743/jiotv-xtras-prototype"
+SITE_URL = "https://akhilrajs.com"
+
+
+def _page_icon() -> Image.Image:
+    """A small drawn favicon (three timeline bars) so the browser tab carries no emoji."""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((0, 0, 63, 63), radius=14, fill="#a8441e")
+    for x0, height in ((13, 22), (27, 34), (41, 26)):
+        top = 32 - height // 2
+        draw.rounded_rectangle((x0, top, x0 + 9, top + height), radius=3, fill="#fbf9f4")
+    return img
+
+
 st.set_page_config(
-    page_title="JioTV+ Xtras — AI Content Classifier",
-    page_icon="🎬",
+    page_title="JioTV+ Xtras · AI content classifier",
+    page_icon=_page_icon(),
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed",
 )
 
-CATEGORY_COLORS = {
-    "dialogue": "#3B82F6",
-    "musical": "#A855F7",
-    "action": "#EF4444",
-    "transition": "#F59E0B",
-    "credits": "#6B7280",
-    "silence": "#374151",
-    "unknown": "#9CA3AF",
+# --- Design tokens -----------------------------------------------------------
+
+# label, fill colour, text colour on the fill (all fills pass 4.5:1 with their text)
+CATEGORIES = {
+    "musical": ("Musical", "#a8441e", "#fbf9f4"),
+    "dialogue": ("Dialogue", "#4b4840", "#fbf9f4"),
+    "action": ("Action", "#3f6d4e", "#fbf9f4"),
+    "credits": ("Credits", "#8a6a1f", "#fbf9f4"),
+    "transition": ("Transition", "#5a6b7b", "#fbf9f4"),
+    "silence": ("Silence", "#cfc9bc", "#1c1b18"),
+    "unknown": ("Unknown", "#9b968b", "#1c1b18"),
 }
 
-CATEGORY_ICONS = {
-    "dialogue": "💬",
-    "musical": "🎵",
-    "action": "⚡",
-    "transition": "🎞️",
-    "credits": "📋",
-    "silence": "🔇",
-    "unknown": "❓",
+# Routing tiers: same thresholds as before (>=90% auto, 70-90% QA, <70% human)
+TIERS = {
+    "auto": {"label": "Auto-tag", "rule": "90% or more",
+             "action": "published without review"},
+    "qa": {"label": "QA review", "rule": "70–90%",
+           "action": "a reviewer confirms or fixes it"},
+    "human": {"label": "Human annotator", "rule": "under 70%",
+              "action": "a person labels it"},
 }
 
-st.markdown("""
+MODE_LABELS = {
+    "audio": "Audio only",
+    "vlm": "Vision only",
+    "hybrid": "Hybrid (audio + vision)",
+}
+
+HYBRID_RE = re.compile(
+    r"\[Hybrid\]\s*VLM:\s*(\w+)\s*\((\d+)%\)\s*\+\s*Audio:\s*(\w+)\s*\((\d+)%\)"
+)
+
+CSS = """
 <style>
-    .main-header {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-        padding: 1.5rem 2rem;
-        border-radius: 12px;
-        margin-bottom: 1.5rem;
-        color: white;
-    }
-    .main-header h1 { margin: 0; font-size: 1.8rem; }
-    .main-header p { margin: 0.3rem 0 0 0; opacity: 0.7; font-size: 0.9rem; }
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Inter:wght@400;500;600&display=swap');
+:root {
+  --xt-bg: #f6f3ec; --xt-sunk: #eeeae0; --xt-surface: #fbf9f4;
+  --xt-ink: #1c1b18; --xt-ink-2: #4b4840; --xt-muted: #6f6b62;
+  --xt-rule: #dcd6c9; --xt-rule-strong: #c4bdac;
+  --xt-accent: #a8441e; --xt-live: #2f7a55;
+  --xt-auto-fg: #276a49; --xt-auto-bg: #e3efe7; --xt-auto-dot: #2f7a55;
+  --xt-qa-fg: #8a5a00; --xt-qa-bg: #f6ead2; --xt-qa-dot: #b7791f;
+  --xt-human-fg: #a8441e; --xt-human-bg: #f3e1d6; --xt-human-dot: #a8441e;
+  --xt-display: 'Fraunces', Georgia, 'Times New Roman', serif;
+  --xt-body: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --xt-radius: 14px;
+}
+.stApp { font-family: var(--xt-body); }
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stWidgetLabel"],
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stExpander"] summary,
+.stApp button, .stApp input, .stApp textarea { font-family: var(--xt-body); }
+.stApp h1, .stApp h2, .stApp h3 { font-family: var(--xt-display); font-weight: 400; letter-spacing: -0.01em; }
+.block-container, [data-testid="stMainBlockContainer"] { max-width: 1120px; padding-top: 4rem; padding-bottom: 4rem; }
 
-    .timeline-container {
-        background: #1a1a2e;
-        border-radius: 10px;
-        padding: 16px;
-        margin: 12px 0;
-    }
-    .timeline-bar {
-        display: flex;
-        height: 40px;
-        border-radius: 6px;
-        overflow: hidden;
-        cursor: pointer;
-    }
-    .timeline-segment {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 11px;
-        color: white;
-        font-weight: 600;
-        transition: opacity 0.2s;
-        position: relative;
-    }
-    .timeline-segment:hover { opacity: 0.8; }
-    .timeline-legend {
-        display: flex;
-        gap: 16px;
-        margin-top: 10px;
-        flex-wrap: wrap;
-    }
-    .legend-item {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        color: #ccc;
-    }
-    .legend-dot {
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-    }
+/* Streamlit gives markdown blocks a -1rem bottom margin (for paragraph spacing); restore it */
+.xt { color: var(--xt-ink); font-family: var(--xt-body); padding-bottom: 1rem; }
+.xt p { margin: 0; }
+.xt a { color: var(--xt-ink); text-decoration-color: rgba(168, 68, 30, .55); text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+.xt a:hover { color: var(--xt-accent); text-decoration-color: var(--xt-accent); }
 
-    .segment-card {
-        background: #1e293b;
-        border-radius: 8px;
-        padding: 14px 16px;
-        margin: 6px 0;
-        border-left: 4px solid;
-        transition: transform 0.1s;
-    }
-    .segment-card:hover { transform: translateX(4px); }
-    .segment-card .cat-label {
-        font-weight: 700;
-        font-size: 14px;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-    .segment-card .time-label {
-        font-size: 12px;
-        color: #94a3b8;
-        margin-top: 2px;
-    }
-    .segment-card .desc {
-        font-size: 12px;
-        color: #cbd5e1;
-        margin-top: 6px;
-    }
-    .segment-card .confidence-bar {
-        height: 4px;
-        border-radius: 2px;
-        margin-top: 8px;
-        background: #334155;
-    }
-    .segment-card .confidence-fill {
-        height: 100%;
-        border-radius: 2px;
-    }
+/* Header */
+.xt-head { padding: 0 0 6px; }
+.xt-eyebrow { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; color: var(--xt-muted); }
+.xt-pill { display: inline-block; padding: 2px 9px; border: 1px solid var(--xt-rule-strong); border-radius: 999px; font-size: .7rem; letter-spacing: .08em; color: var(--xt-ink-2); background: var(--xt-surface); }
+.xt-title { font-family: var(--xt-display); font-weight: 400; font-size: clamp(2.25rem, 5vw, 3.25rem); line-height: 1.05; letter-spacing: -0.02em; margin: 14px 0 12px; color: var(--xt-ink); }
+.xt .xt-lede { font-size: 1.08rem; line-height: 1.6; color: var(--xt-ink-2); max-width: 46rem; }
+.xt-links { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin-top: 14px; font-size: .92rem; }
+.xt-links .xt-sep { color: var(--xt-rule-strong); }
 
-    .metric-card {
-        background: #1e293b;
-        border-radius: 8px;
-        padding: 16px;
-        text-align: center;
-    }
-    .metric-card .metric-value {
-        font-size: 28px;
-        font-weight: 800;
-        color: #e2e8f0;
-    }
-    .metric-card .metric-label {
-        font-size: 11px;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        margin-top: 4px;
-    }
+/* Section headings and notes */
+.xt .xt-h { font-family: var(--xt-display); font-weight: 400; font-size: 1.5rem; line-height: 1.2; letter-spacing: -0.01em; color: var(--xt-ink); margin: 18px 0 2px; }
+.xt .xt-sub { font-size: .92rem; color: var(--xt-muted); margin: 2px 0 12px; }
+.xt-note { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; padding: 12px 16px; border: 1px solid var(--xt-rule); border-radius: 12px; background: var(--xt-surface); font-size: .93rem; color: var(--xt-ink-2); }
+.xt-note strong { color: var(--xt-ink); font-weight: 600; }
+.xt-note .xt-note-meta { color: var(--xt-muted); }
 
-    .confidence-tier {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: 600;
-    }
-    .tier-auto { background: #065f46; color: #6ee7b7; }
-    .tier-qa { background: #713f12; color: #fcd34d; }
-    .tier-human { background: #7f1d1d; color: #fca5a5; }
+/* Stat tiles */
+.xt-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.xt-stat { background: var(--xt-surface); border: 1px solid var(--xt-rule); border-radius: 12px; padding: 14px 16px 13px; min-width: 0; }
+.xt-stat-val { font-family: var(--xt-display); font-size: 2.1rem; line-height: 1.1; color: var(--xt-ink); font-variant-numeric: tabular-nums; }
+.xt-stat-label { display: flex; align-items: center; gap: 7px; margin-top: 6px; font-size: .88rem; font-weight: 500; color: var(--xt-ink-2); }
+.xt-stat-rule { font-size: .8rem; color: var(--xt-muted); margin-top: 1px; }
+.xt-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
 
-    .mode-badge {
-        display: inline-block;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 600;
-    }
-    .mode-audio { background: #1e3a5f; color: #60a5fa; }
-    .mode-vlm { background: #3b0764; color: #c084fc; }
-    .mode-hybrid { background: #14532d; color: #86efac; }
+/* Timeline */
+.xt-panel { background: var(--xt-surface); border: 1px solid var(--xt-rule); border-radius: var(--xt-radius); padding: 18px 20px 16px; }
+.xt-track { position: relative; height: 46px; border-radius: 8px; overflow: hidden; background: var(--xt-sunk); }
+.xt-piece { position: absolute; top: 0; bottom: 0; display: flex; align-items: center; gap: 7px; padding: 0 10px; overflow: hidden; white-space: nowrap; font-size: .8rem; font-weight: 500; container-type: inline-size; }
+.xt-piece + .xt-piece { box-shadow: inset 2px 0 0 var(--xt-surface); }
+.xt-piece-num { font-weight: 600; font-variant-numeric: tabular-nums; }
+.xt-piece-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+@container (max-width: 64px) { .xt-piece-name { display: none; } }
+.xt-axis { position: relative; height: 24px; margin-top: 4px; }
+.xt-tick { position: absolute; top: 0; height: 100%; }
+.xt-tick::before { content: ""; position: absolute; top: 0; left: 0; width: 1px; height: 5px; background: var(--xt-rule-strong); }
+.xt-tick span { position: absolute; top: 7px; left: 0; transform: translateX(-50%); font-size: .75rem; color: var(--xt-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.xt-tick:first-child span { transform: none; }
+.xt-tick.xt-tick-end::before { left: -1px; }
+.xt-tick.xt-tick-end span { transform: translateX(-100%); }
+.xt-legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 10px; font-size: .88rem; color: var(--xt-ink-2); }
+.xt-legend-title { font-size: .72rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--xt-muted); align-self: center; }
+.xt-key { display: inline-flex; align-items: center; gap: 8px; }
+.xt-swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; display: inline-block; }
+.xt-key b { font-weight: 600; color: var(--xt-ink); font-variant-numeric: tabular-nums; }
+.xt-key .xt-key-meta { color: var(--xt-muted); }
+.xt .xt-foot { margin-top: 10px; font-size: .8rem; color: var(--xt-muted); line-height: 1.5; }
 
-    div[data-testid="stSidebar"] { background: #0f172a; }
-    .stApp { background: #0f172a; color: #e2e8f0; }
+/* Routing callout */
+.xt .xt-callout { border-left: 3px solid var(--xt-accent); margin: 8px 0 6px; padding: 4px 0 4px 16px; font-size: 1rem; line-height: 1.65; color: var(--xt-ink-2); max-width: 52rem; }
+
+/* Segment cards */
+.xt-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 14px; }
+.xt-card { background: var(--xt-surface); border: 1px solid var(--xt-rule); border-radius: var(--xt-radius); padding: 16px 18px 16px; min-width: 0; }
+.xt-card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: .85rem; color: var(--xt-muted); }
+.xt-card-top .xt-time { color: var(--xt-ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+.xt-card-main { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 12px; }
+.xt-chip { display: inline-flex; align-items: center; padding: 3px 11px; border-radius: 999px; font-size: .82rem; font-weight: 600; letter-spacing: .01em; }
+.xt-conf { font-family: var(--xt-display); font-size: 1.9rem; line-height: 1; color: var(--xt-ink); font-variant-numeric: tabular-nums; }
+.xt-conf small { font-family: var(--xt-body); font-size: .72rem; color: var(--xt-muted); margin-left: 4px; letter-spacing: .02em; }
+.xt-meter { position: relative; height: 6px; margin-top: 12px; border-radius: 3px; background: var(--xt-sunk); }
+.xt-meter-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+.xt-mark { position: absolute; top: -3px; width: 1px; height: 12px; background: var(--xt-ink-2); }
+.xt-marks { position: relative; height: 14px; margin-top: 3px; font-size: .68rem; color: var(--xt-muted); font-variant-numeric: tabular-nums; }
+.xt-marks span { position: absolute; transform: translateX(-50%); }
+.xt-route { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 8px; font-size: .84rem; color: var(--xt-muted); }
+.xt-tier { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: .8rem; font-weight: 600; }
+.xt-tier-auto { color: var(--xt-auto-fg); background: var(--xt-auto-bg); }
+.xt-tier-qa { color: var(--xt-qa-fg); background: var(--xt-qa-bg); }
+.xt-tier-human { color: var(--xt-human-fg); background: var(--xt-human-bg); }
+.xt-flag { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 3px 10px; border: 1px solid var(--xt-qa-dot); border-radius: 999px; font-size: .78rem; font-weight: 600; color: var(--xt-qa-fg); background: var(--xt-qa-bg); }
+.xt-block { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--xt-rule); }
+.xt-block-title { display: flex; justify-content: space-between; gap: 8px; font-size: .72rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--xt-muted); margin-bottom: 8px; }
+.xt-block-title span { font-weight: 400; letter-spacing: .02em; text-transform: none; }
+.xt-sig { display: grid; grid-template-columns: 4.2rem 1fr auto; align-items: center; gap: 4px 10px; font-size: .9rem; }
+.xt-sig-src { color: var(--xt-muted); }
+.xt-sig-cat { display: inline-flex; align-items: center; gap: 7px; color: var(--xt-ink); }
+.xt-sig-val { font-variant-numeric: tabular-nums; color: var(--xt-ink); font-weight: 500; }
+.xt-sig-na { color: var(--xt-muted); font-style: italic; }
+.xt .xt-verdict { margin-top: 8px; font-size: .84rem; line-height: 1.5; color: var(--xt-ink-2); }
+.xt .xt-quote { font-size: .84rem; line-height: 1.5; color: var(--xt-ink-2); }
+.xt-evidence { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+.xt-evidence div { font-size: .8rem; color: var(--xt-muted); }
+.xt-evidence b { display: block; font-size: .92rem; font-weight: 500; color: var(--xt-ink); font-variant-numeric: tabular-nums; }
+
+/* How it works */
+.xt-steps { margin: 4px 0 0; padding: 0; list-style: none; counter-reset: xt; }
+.xt-steps li { counter-increment: xt; position: relative; padding: 0 0 12px 34px; font-size: .95rem; line-height: 1.6; color: var(--xt-ink-2); }
+.xt-steps li::before { content: counter(xt); position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--xt-rule-strong); font-size: .72rem; font-weight: 600; color: var(--xt-ink-2); display: flex; align-items: center; justify-content: center; }
+.xt-steps strong { color: var(--xt-ink); font-weight: 600; }
+.xt-tiers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 6px 0 14px; }
+.xt-tierbox { border: 1px solid var(--xt-rule); border-radius: 12px; padding: 12px 14px; background: var(--xt-surface); font-size: .86rem; line-height: 1.5; color: var(--xt-ink-2); }
+.xt-tierbox .xt-tier { margin-bottom: 6px; }
+.xt .xt-prose { font-size: .95rem; line-height: 1.65; color: var(--xt-ink-2); max-width: 50rem; }
+.xt .xt-prose + .xt-prose { margin-top: 10px; }
+.xt .xt-kicker { font-size: .72rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--xt-muted); margin: 14px 0 8px; }
+
+.xt-footer { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--xt-rule); font-size: .85rem; color: var(--xt-muted); }
+
+@media (max-width: 720px) {
+  .xt-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .xt-stat-val { font-size: 1.8rem; }
+  .xt-tiers { grid-template-columns: 1fr; }
+  .xt-panel { padding: 16px 14px 14px; }
+  .xt-legend { gap: 6px 16px; }
+}
+@media (max-width: 520px) {
+  .xt-piece-name { display: none; }
+  .xt-legend-title { flex-basis: 100%; }
+  .xt-piece { justify-content: center; padding: 0 4px; }
+}
 </style>
-""", unsafe_allow_html=True)
+"""
 
-st.markdown("""
-<div class="main-header">
-    <h1>🎬 JioTV+ Xtras — AI Content Classifier</h1>
-    <p>Contextual AI overlay prototype • Detect songs, action, dialogue & credits in video content</p>
-</div>
-""", unsafe_allow_html=True)
+st.markdown(CSS, unsafe_allow_html=True)
+
+
+# --- Helpers -----------------------------------------------------------------
+
+def esc(value) -> str:
+    return html.escape(str(value), quote=True)
 
 
 def format_time(seconds: float) -> str:
@@ -200,129 +243,366 @@ def format_time(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def get_confidence_tier(conf: float) -> tuple[str, str]:
+def category_style(category: str) -> tuple[str, str, str]:
+    return CATEGORIES.get(category, (str(category).title(), "#9b968b", "#1c1b18"))
+
+
+def get_confidence_tier(conf: float) -> str:
     if conf >= 0.9:
-        return "AUTO-TAG", "tier-auto"
+        return "auto"
     elif conf >= 0.7:
-        return "QA REVIEW", "tier-qa"
-    return "HUMAN ANNOTATOR", "tier-human"
+        return "qa"
+    return "human"
 
 
-def render_timeline(segments: list[dict], total_duration: float):
+def tier_badge(tier: str) -> str:
+    return f'<span class="xt-tier xt-tier-{tier}">{TIERS[tier]["label"]}</span>'
+
+
+def md(markup: str) -> None:
+    """Render one block of custom HTML. Kept on one line so Markdown never re-parses it."""
+    st.markdown(f'<div class="xt">{markup}</div>', unsafe_allow_html=True)
+
+
+def sorted_segments(segments: list[dict]) -> list[dict]:
+    return sorted(segments, key=lambda s: (s["start_time"], s["end_time"]))
+
+
+def runtime_share(segments: list[dict]) -> dict[str, float]:
+    """Seconds per category. Adjacent clips overlap, so each overlap is split at its midpoint."""
+    seconds: dict[str, float] = {}
+    for i, seg in enumerate(segments):
+        start, end = seg["start_time"], seg["end_time"]
+        if i > 0 and segments[i - 1]["end_time"] > start:
+            start = (start + segments[i - 1]["end_time"]) / 2
+        if i + 1 < len(segments) and segments[i + 1]["start_time"] < end:
+            end = (end + segments[i + 1]["start_time"]) / 2
+        seconds[seg["category"]] = seconds.get(seg["category"], 0.0) + max(0.0, end - start)
+    return dict(sorted(seconds.items(), key=lambda kv: -kv[1]))
+
+
+def explain(seg: dict, mode: str) -> dict:
+    """Recover the per-signal story for a segment from what the pipeline recorded."""
+    desc = seg.get("description", "") or ""
+    scores = seg.get("scores") or {}
+    audio = None
+    if scores:
+        top = max(scores, key=scores.get)
+        audio = (top, round(scores[top] * 100))
+
+    match = HYBRID_RE.search(desc)
+    if match:
+        vision = (match.group(1).lower(), int(match.group(2)))
+        audio = (match.group(3).lower(), int(match.group(4)))
+        return {"kind": "fused", "vision": vision, "audio": audio, "agree": vision[0] == audio[0]}
+    if mode == "hybrid":
+        return {"kind": "audio_fallback", "vision": None,
+                "audio": audio or (seg["category"], round(seg["confidence"] * 100))}
+    if mode == "vlm" or desc.startswith("VLM:"):
+        text = desc[4:].strip() if desc.startswith("VLM:") else desc
+        return {"kind": "vision", "vision": (seg["category"], round(seg["confidence"] * 100)),
+                "audio": None, "quote": text}
+    return {"kind": "audio", "vision": None,
+            "audio": audio or (seg["category"], round(seg["confidence"] * 100))}
+
+
+# --- Rendering ---------------------------------------------------------------
+
+def render_header() -> None:
+    md(
+        '<header class="xt-head">'
+        '<div class="xt-eyebrow"><span class="xt-pill">Prototype</span><span>AI content classifier</span></div>'
+        '<div class="xt-title" role="heading" aria-level="1">JioTV+ Xtras</div>'
+        '<p class="xt-lede">Splits a film clip into segments, labels each one as musical, dialogue, '
+        'action, credits or transition from what it hears and sees, then routes every label by how '
+        'confident the model is: auto-tag, QA review or a human annotator.</p>'
+        '<nav class="xt-links" aria-label="Project links">'
+        f'<a href="{CASE_STUDY_URL}" target="_blank" rel="noopener">Read the case study</a>'
+        '<span class="xt-sep" aria-hidden="true">/</span>'
+        f'<a href="{SOURCE_URL}" target="_blank" rel="noopener">Source on GitHub</a>'
+        '</nav>'
+        '</header>'
+    )
+
+
+def render_how_it_works() -> None:
+    with st.expander("How it works"):
+        tiers_html = "".join(
+            f'<div class="xt-tierbox">{tier_badge(key)}<div><strong>{t["rule"]}</strong>: '
+            f'{t["action"]}.</div></div>'
+            for key, t in TIERS.items()
+        )
+        md(
+            '<p class="xt-kicker">Pipeline</p>'
+            '<ol class="xt-steps">'
+            '<li><strong>Cut.</strong> The video is split into short overlapping clips (10 seconds '
+            'with 2 seconds of overlap by default), so a scene change never falls blind between two windows.</li>'
+            '<li><strong>Listen.</strong> librosa measures each clip&#8217;s audio: tempo, beat strength, '
+            'harmonic ratio, spectral centroid, zero-crossing rate and loudness. Weighted rules turn those '
+            'into musical, dialogue and action scores.</li>'
+            '<li><strong>Look</strong> (vision and hybrid modes). Sampled frames go to a small '
+            'vision-language model on a local Ollama server. It describes each frame, keywords map the '
+            'description to one of the five labels, and the frames vote.</li>'
+            '<li><strong>Fuse.</strong> In hybrid mode, if vision is more than 40% sure its label wins and '
+            'confidence blends 60% vision with 40% audio; otherwise audio decides. Neighbouring clips with '
+            'the same label merge into one segment.</li>'
+            '<li><strong>Route.</strong> Every segment goes to one of three queues by confidence.</li>'
+            '</ol>'
+            f'<div class="xt-tiers">{tiers_html}</div>'
+            '<p class="xt-kicker">Why route by confidence</p>'
+            '<p class="xt-prose">A wrong label on screen, like a song marker over a fight scene, costs more '
+            'viewer trust than a missing one. Routing lets automation handle what the models are sure of '
+            'while people check the ambiguous stretches, so quality holds without labelling every hour of '
+            'content by hand.</p>'
+            '<p class="xt-prose">Prototype limits: the audio rules can only tell musical, dialogue and '
+            'action apart, so credits and transitions need the vision model; thresholds are hand-set, not '
+            'learned.</p>'
+        )
+
+
+def render_stats(segments: list[dict]) -> None:
+    counts = {key: 0 for key in TIERS}
+    for seg in segments:
+        counts[get_confidence_tier(seg["confidence"])] += 1
+    tiles = [
+        f'<div class="xt-stat"><div class="xt-stat-val">{len(segments)}</div>'
+        f'<div class="xt-stat-label">Segments</div>'
+        f'<div class="xt-stat-rule">in this run</div></div>'
+    ]
+    for key, tier in TIERS.items():
+        tiles.append(
+            f'<div class="xt-stat"><div class="xt-stat-val">{counts[key]}</div>'
+            f'<div class="xt-stat-label"><span class="xt-dot" style="background:var(--xt-{key}-dot)"></span>'
+            f'{tier["label"]}</div><div class="xt-stat-rule">{tier["rule"]}</div></div>'
+        )
+    md(f'<div class="xt-stats" role="list">{"".join(tiles)}</div>')
+
+
+def axis_ticks(total: float) -> str:
+    step = 3600
+    for candidate in (5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600):
+        if total / candidate <= 6:
+            step = candidate
+            break
+    ticks, t = [], 0
+    while t < total * 0.88:
+        ticks.append(f'<span class="xt-tick" style="left:{t / total * 100:.3f}%"><span>{format_time(t)}</span></span>')
+        t += step
+    ticks.append(f'<span class="xt-tick xt-tick-end" style="left:100%"><span>{format_time(total)}</span></span>')
+    return "".join(ticks)
+
+
+def render_timeline(segments: list[dict], total_duration: float, clip_overlap=None, intro: str = "") -> None:
     if not segments or total_duration <= 0:
         return
 
-    html_parts = []
-    for seg in segments:
-        width_pct = max(1, (seg["end_time"] - seg["start_time"]) / total_duration * 100)
-        color = CATEGORY_COLORS.get(seg["category"], "#666")
-        icon = CATEGORY_ICONS.get(seg["category"], "")
-        label = f'{icon} {seg["category"][:3].upper()}' if width_pct > 5 else icon
-        html_parts.append(
-            f'<div class="timeline-segment" style="width:{width_pct:.1f}%;background:{color};" '
-            f'title="{seg["category"].title()}: {format_time(seg["start_time"])} - {format_time(seg["end_time"])}">'
-            f'{label}</div>'
+    def pct(t: float) -> float:
+        return max(0.0, min(100.0, t / total_duration * 100))
+
+    pieces, aria, has_overlap = [], [], False
+    n = len(segments)
+    for i, seg in enumerate(segments):
+        start, end = seg["start_time"], seg["end_time"]
+        label, fill, on = category_style(seg["category"])
+        prev_end = segments[i - 1]["end_time"] if i > 0 else None
+        next_start = segments[i + 1]["start_time"] if i + 1 < n else None
+        solo_start = max(start, prev_end) if prev_end is not None and prev_end > start else start
+        solo_end = min(end, next_start) if next_start is not None and next_start < end else end
+        conf = f'{seg["confidence"] * 100:.0f}%'
+        tip = f'{i + 1}. {label}, {format_time(start)}–{format_time(end)}, {conf} confidence'
+        aria.append(f'{label} {format_time(start)} to {format_time(end)}')
+        if solo_end > solo_start:
+            left, width = pct(solo_start), pct(solo_end) - pct(solo_start)
+            pieces.append(
+                f'<div class="xt-piece" style="left:{left:.3f}%;width:{width:.3f}%;background:{fill};color:{on}" '
+                f'title="{esc(tip)}"><span class="xt-piece-num">{i + 1}</span>'
+                f'<span class="xt-piece-name">{label}</span></div>'
+            )
+        if next_start is not None and next_start < end:
+            has_overlap = True
+            ov_end = min(end, segments[i + 1]["end_time"])
+            _, fill_next, _ = category_style(segments[i + 1]["category"])
+            left, width = pct(next_start), pct(ov_end) - pct(next_start)
+            pieces.append(
+                f'<div class="xt-piece" style="left:{left:.3f}%;width:{width:.3f}%;'
+                f'background:repeating-linear-gradient(135deg,{fill} 0 4px,{fill_next} 4px 8px)" '
+                f'title="Clip overlap, {format_time(next_start)}–{format_time(ov_end)}"></div>'
+            )
+
+    legend = []
+    for cat, secs in runtime_share(segments).items():
+        label, fill, _ = category_style(cat)
+        legend.append(
+            f'<span class="xt-key"><span class="xt-swatch" style="background:{fill}"></span>{label} '
+            f'<b>{secs / total_duration * 100:.0f}%</b><span class="xt-key-meta">{format_time(secs)}</span></span>'
+        )
+    if has_overlap:
+        _, a, _ = category_style(segments[0]["category"])
+        legend.append(
+            '<span class="xt-key"><span class="xt-swatch" style="background:repeating-linear-gradient('
+            f'135deg,{a} 0 3px,var(--xt-surface) 3px 6px)"></span>Clip overlap</span>'
         )
 
-    legend_html = ""
-    seen = set()
+    foot = ""
+    if has_overlap:
+        overlap_txt = f"{clip_overlap:g} seconds" if isinstance(clip_overlap, (int, float)) else "a little"
+        foot = (f'<p class="xt-foot">Neighbouring clips overlap by {overlap_txt} (hatched); '
+                'runtime shares split each overlap at its midpoint.</p>')
+
+    md(
+        f'{intro}<div class="xt-panel">'
+        f'<div class="xt-track" role="img" aria-label="Timeline: {esc("; ".join(aria))}">{"".join(pieces)}</div>'
+        f'<div class="xt-axis" aria-hidden="true">{axis_ticks(total_duration)}</div>'
+        f'<div class="xt-legend"><span class="xt-legend-title">Share of runtime</span>{"".join(legend)}</div>'
+        f'{foot}'
+        '</div>'
+    )
+
+
+def render_routing_summary(segments: list[dict], mode: str, is_demo: bool) -> None:
+    n = len(segments)
+    counts = {key: 0 for key in TIERS}
     for seg in segments:
-        cat = seg["category"]
-        if cat not in seen:
-            seen.add(cat)
-            color = CATEGORY_COLORS.get(cat, "#666")
-            icon = CATEGORY_ICONS.get(cat, "")
-            legend_html += f'<div class="legend-item"><div class="legend-dot" style="background:{color};"></div>{icon} {cat.title()}</div>'
+        counts[get_confidence_tier(seg["confidence"])] += 1
 
-    st.markdown(f"""
-    <div class="timeline-container">
-        <div style="display:flex;justify-content:space-between;color:#94a3b8;font-size:11px;margin-bottom:6px;">
-            <span>0:00</span>
-            <span>Color-coded AI-detected segments</span>
-            <span>{format_time(total_duration)}</span>
-        </div>
-        <div class="timeline-bar">{''.join(html_parts)}</div>
-        <div class="timeline-legend">{legend_html}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    if counts["human"] == n:
+        lead = (f"Every segment scored under 70%, so all {n} go to a human annotator instead of being auto-tagged."
+                if n > 1 else "The only segment scored under 70%, so it goes to a human annotator.")
+    elif counts["auto"] == n:
+        lead = "Every segment cleared 90%, so all of them can be auto-tagged without review."
+    else:
+        lead = (f"{counts['auto']} of {n} segments cleared 90% and can be auto-tagged; "
+                f"{counts['qa']} {'goes' if counts['qa'] == 1 else 'go'} to QA review and "
+                f"{counts['human']} to a human annotator.")
 
-
-def render_segment_cards(segments: list[dict]):
-    for seg in segments:
-        color = CATEGORY_COLORS.get(seg["category"], "#666")
-        icon = CATEGORY_ICONS.get(seg["category"], "")
-        tier_label, tier_class = get_confidence_tier(seg["confidence"])
-        conf_pct = seg["confidence"] * 100
-
-        st.markdown(f"""
-        <div class="segment-card" style="border-left-color:{color};">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-                <div>
-                    <div class="cat-label" style="color:{color};">{icon} {seg["category"]}</div>
-                    <div class="time-label">{format_time(seg["start_time"])} → {format_time(seg["end_time"])} ({seg.get("duration", seg["end_time"]-seg["start_time"]):.0f}s)</div>
-                </div>
-                <div style="text-align:right;">
-                    <div class="confidence-tier {tier_class}">{tier_label}</div>
-                    <div style="font-size:18px;font-weight:700;color:{color};margin-top:2px;">{conf_pct:.0f}%</div>
-                </div>
-            </div>
-            <div class="desc">{seg.get("description", "")}</div>
-            <div class="confidence-bar"><div class="confidence-fill" style="width:{conf_pct}%;background:{color};"></div></div>
-        </div>
-        """, unsafe_allow_html=True)
+    sentences = [lead]
+    disagreements = []
+    for i, seg in enumerate(segments):
+        info = explain(seg, mode)
+        if info["kind"] == "fused" and not info["agree"]:
+            disagreements.append((i, seg, info))
+    if len(disagreements) == 1:
+        i, seg, info = disagreements[0]
+        sentences.append(
+            f"In segment {i + 1} ({format_time(seg['start_time'])}–{format_time(seg['end_time'])}) "
+            f"vision said {info['vision'][0]} while audio said {info['audio'][0]}."
+        )
+        if is_demo:
+            sentences.append("The clip is made entirely of songs, so that label is probably wrong, and it is "
+                             "exactly the kind of call the routing keeps off the screen.")
+    elif disagreements:
+        nums = ", ".join(str(i + 1) for i, _, _ in disagreements)
+        sentences.append(f"Vision and audio disagreed in segments {nums}.")
+    if counts["auto"] < n and not (is_demo and len(disagreements) == 1):
+        sentences.append("That is what routing is for: tag what the models are sure of and send the uncertain "
+                         "stretches to a person before a wrong label reaches viewers.")
+    md(f'<p class="xt-callout">{esc(" ".join(sentences))}</p>')
 
 
-def render_metrics(segments: list[dict], total_duration: float):
+def render_segment_cards(segments: list[dict], mode: str, clip_duration=None, intro: str = "") -> None:
+    cards = []
+    for i, seg in enumerate(segments):
+        label, fill, on = category_style(seg["category"])
+        conf = seg["confidence"]
+        tier = get_confidence_tier(conf)
+        dur = seg.get("duration", seg["end_time"] - seg["start_time"])
+        info = explain(seg, mode)
+
+        flag = ""
+        if info["kind"] == "fused" and not info["agree"]:
+            flag = ('<div class="xt-flag"><span class="xt-dot" style="background:var(--xt-qa-dot)"></span>'
+                    'Audio and vision disagree</div>')
+
+        def sig_row(source: str, value) -> str:
+            if value is None:
+                return (f'<span class="xt-sig-src">{source}</span><span class="xt-sig-na">inconclusive</span>'
+                        '<span class="xt-sig-val"></span>')
+            cat, p = value
+            c_label, c_fill, _ = category_style(cat)
+            return (f'<span class="xt-sig-src">{source}</span>'
+                    f'<span class="xt-sig-cat"><span class="xt-swatch" style="background:{c_fill}"></span>{c_label}</span>'
+                    f'<span class="xt-sig-val">{p}%</span>')
+
+        rows, verdict = [], ""
+        if info["kind"] == "fused":
+            rows = [sig_row("Vision", info["vision"]), sig_row("Audio", info["audio"])]
+            verdict = ("Both signals agree." if info["agree"] else
+                       "Vision cleared the 40% bar, so its label wins; confidence blends 60% vision, 40% audio.")
+        elif info["kind"] == "audio_fallback":
+            rows = [sig_row("Vision", None), sig_row("Audio", info["audio"])]
+            verdict = "Vision was 40% sure or less on this clip, so the label comes from audio alone."
+        elif info["kind"] == "vision":
+            rows = [sig_row("Vision", info["vision"])]
+            quote = info.get("quote", "")
+            if quote:
+                verdict = f'Frame description: &#8220;{esc(quote)}&#8221;'
+        else:
+            rows = [sig_row("Audio", info["audio"])]
+
+        first_clip = ""
+        if isinstance(clip_duration, (int, float)) and dur > clip_duration + 0.01:
+            first_clip = "<span>first clip in segment</span>"
+        signals = (f'<div class="xt-block"><div class="xt-block-title">How it was labelled{first_clip}</div>'
+                   f'<div class="xt-sig">{"".join(rows)}</div>'
+                   + (f'<p class="xt-verdict">{verdict}</p>' if verdict else "") + '</div>')
+
+        evidence = ""
+        feats = seg.get("features") or {}
+        if "tempo" in feats:
+            items = [
+                ("Tempo", f'{feats["tempo"]:.0f} BPM'),
+                ("Beat strength", f'{feats.get("beat_strength", 0):.1f} per s'),
+                ("Harmonic ratio", f'{feats.get("harmonic_ratio", 0):.2f}'),
+                ("Spectral centroid", f'{feats.get("centroid_mean", 0):,.0f} Hz'),
+            ]
+            evidence = ('<div class="xt-block"><div class="xt-block-title">Audio evidence</div>'
+                        '<div class="xt-evidence">'
+                        + "".join(f'<div><b>{v}</b>{k}</div>' for k, v in items)
+                        + '</div></div>')
+
+        cards.append(
+            '<article class="xt-card">'
+            f'<div class="xt-card-top"><span>Segment {i + 1}</span>'
+            f'<span><span class="xt-time">{format_time(seg["start_time"])}–{format_time(seg["end_time"])}</span>'
+            f' · {dur:.0f} s</span></div>'
+            '<div class="xt-card-main">'
+            f'<span class="xt-chip" style="background:{fill};color:{on}">{label}</span>'
+            f'<span class="xt-conf">{conf * 100:.0f}%<small>confidence</small></span></div>'
+            f'<div class="xt-meter" aria-hidden="true"><div class="xt-meter-fill" '
+            f'style="width:{conf * 100:.1f}%;background:var(--xt-{tier}-dot)"></div>'
+            '<span class="xt-mark" style="left:70%"></span><span class="xt-mark" style="left:90%"></span></div>'
+            '<div class="xt-marks" aria-hidden="true"><span style="left:70%">70</span><span style="left:90%">90</span></div>'
+            f'<div class="xt-route"><span>Routed to</span>{tier_badge(tier)}</div>'
+            f'{flag}{signals}{evidence}'
+            '</article>'
+        )
+    md(f'{intro}<div class="xt-cards">{"".join(cards)}</div>')
+
+
+def render_result(data: dict, *, is_demo: bool) -> None:
+    segments = sorted_segments(data.get("segments", []))
+    total = float(data.get("total_duration") or 0)
+    mode = data.get("analysis_mode", "audio")
+    clip_duration = data.get("clip_duration")
+    clip_overlap = data.get("clip_overlap")
+
     if not segments:
+        st.warning("No segments were detected. Try a different clip, or a different analysis mode.")
         return
 
-    category_counts = {}
-    category_durations = {}
-    confidences = []
-    for seg in segments:
-        cat = seg["category"]
-        dur = seg["end_time"] - seg["start_time"]
-        category_counts[cat] = category_counts.get(cat, 0) + 1
-        category_durations[cat] = category_durations.get(cat, 0) + dur
-        confidences.append(seg["confidence"])
-
-    auto_pct = sum(1 for c in confidences if c >= 0.9) / len(confidences) * 100 if confidences else 0
-    avg_conf = sum(confidences) / len(confidences) * 100 if confidences else 0
-
-    cols = st.columns(4)
-    metrics = [
-        (f"{len(segments)}", "Segments Detected"),
-        (f"{avg_conf:.0f}%", "Avg Confidence"),
-        (f"{auto_pct:.0f}%", "Auto-Tag Rate"),
-        (f"{len(category_counts)}", "Categories Found"),
-    ]
-    for col, (value, label) in zip(cols, metrics):
-        col.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">{value}</div>
-            <div class="metric-label">{label}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.markdown("##### Category Breakdown")
-    for cat, dur in sorted(category_durations.items(), key=lambda x: -x[1]):
-        pct = dur / total_duration * 100
-        color = CATEGORY_COLORS.get(cat, "#666")
-        icon = CATEGORY_ICONS.get(cat, "")
-        st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:10px;margin:6px 0;">
-            <div style="width:100px;font-size:13px;color:{color};font-weight:600;">{icon} {cat.title()}</div>
-            <div style="flex:1;background:#1e293b;border-radius:4px;height:20px;">
-                <div style="width:{pct}%;background:{color};height:100%;border-radius:4px;display:flex;align-items:center;padding-left:8px;">
-                    <span style="font-size:10px;color:white;font-weight:600;">{format_time(dur)} ({pct:.0f}%)</span>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    render_stats(segments)
+    render_timeline(segments, total, clip_overlap, intro=(
+        '<div class="xt-h">Timeline</div>'
+        '<p class="xt-sub">Each bar is one labelled segment; the numbers match the cards below.</p>'))
+    render_routing_summary(segments, mode, is_demo)
+    render_segment_cards(segments, mode, clip_duration, intro=(
+        '<div class="xt-h">Segments</div>'
+        '<p class="xt-sub">Label, confidence, routing, and the signals behind each call.</p>'))
+    with st.expander("Raw output (JSON)"):
+        st.json(data, expanded=False)
 
 
-def load_precached_results() -> list[dict] | None:
+def load_precached_results() -> dict | None:
     cache_path = Path(__file__).parent / "demo_results.json"
     if cache_path.exists():
         with open(cache_path) as f:
@@ -330,127 +610,40 @@ def load_precached_results() -> list[dict] | None:
     return None
 
 
-# --- Sidebar ---
-with st.sidebar:
-    st.markdown("### Configuration")
-
-    analysis_mode = st.radio(
-        "Analysis Mode",
-        ["Audio Analysis (librosa)", "VLM (Ollama)", "Hybrid (Audio + VLM)"],
-        index=0,
-        help="Audio mode works offline. VLM requires Ollama running with a vision model."
-    )
-
-    mode_key = {"Audio Analysis (librosa)": "audio", "VLM (Ollama)": "vlm", "Hybrid (Audio + VLM)": "hybrid"}[analysis_mode]
-    mode_class = {"audio": "mode-audio", "vlm": "mode-vlm", "hybrid": "mode-hybrid"}[mode_key]
-    st.markdown(f'<div class="mode-badge {mode_class}">{mode_key.upper()} MODE</div>', unsafe_allow_html=True)
-
-    if mode_key in ("vlm", "hybrid"):
-        from vlm_classifier import check_ollama_available
-        available, vision_models = check_ollama_available()
-        if available and vision_models:
-            vlm_model = st.selectbox("Vision Model", vision_models)
-            st.success(f"Ollama connected — {len(vision_models)} vision model(s)")
-        elif available:
-            st.warning("Ollama running but no vision models found. Pull one: `ollama pull moondream`")
-            vlm_model = None
-        else:
-            st.error("Ollama not running. Start it: `ollama serve`")
-            vlm_model = None
-    else:
-        vlm_model = None
-
-    st.markdown("---")
-    st.markdown("### Clip Parameters")
-    clip_duration = st.slider("Clip Duration (s)", 5, 30, 10)
-    clip_overlap = st.slider("Overlap (s)", 0, 5, 2)
-
-    st.markdown("---")
-    st.markdown("### Confidence Tiers")
-    st.markdown("""
-    <div style="font-size:12px;line-height:1.8;">
-        <span class="confidence-tier tier-auto">≥90% AUTO-TAG</span><br>
-        <span class="confidence-tier tier-qa">70-90% QA REVIEW</span><br>
-        <span class="confidence-tier tier-human">&lt;70% HUMAN ANNOTATOR</span>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.markdown("### Architecture")
-    st.markdown("""
-    <div style="font-size:11px;color:#94a3b8;line-height:1.6;">
-    <strong>Pipeline:</strong><br>
-    1. Video → 10s clips (2s overlap)<br>
-    2. Audio → librosa features<br>
-    3. Frames → VLM classification<br>
-    4. Fusion + post-processing<br>
-    5. Confidence-based routing<br><br>
-    <strong>JioTV+ Xtras Concept</strong><br>
-    Amazon X-Ray-style contextual overlay
-    </div>
-    """, unsafe_allow_html=True)
+@st.cache_data(ttl=30, show_spinner=False)
+def ollama_status() -> tuple[bool, list[str]]:
+    from vlm_classifier import check_ollama_available
+    return check_ollama_available()
 
 
-# --- Main Content ---
-uploaded_file = st.file_uploader(
-    "Upload a video clip (.mp4, .mov, .avi, .mkv)",
-    type=["mp4", "mov", "avi", "mkv"],
-    help="Upload a short clip (1-5 min recommended) from any Indian film to analyze"
-)
+# --- Live pipeline (logic unchanged from the original app) --------------------
 
-use_demo = st.checkbox("Use pre-cached demo results (for reliable demo)", value=False)
+class PipelineError(Exception):
+    pass
 
-if use_demo:
-    demo_data = load_precached_results()
-    if demo_data:
-        segments = demo_data["segments"]
-        total_duration = demo_data["total_duration"]
-        st.info(f"Loaded pre-cached results: {demo_data.get('video_name', 'Demo clip')} ({format_time(total_duration)})")
 
-        render_timeline(segments, total_duration)
+def run_pipeline(video_path: str, video_name: str, mode_key: str, vlm_model, clip_duration: int,
+                 clip_overlap: int, progress) -> tuple[dict, str | None]:
+    """Run the analysis. Returns (result, warning). Raises PipelineError on fatal steps."""
+    from video_processor import get_video_duration, extract_audio
+    from audio_analyzer import analyze_full_audio
 
-        col1, col2 = st.columns([3, 2])
-        with col1:
-            st.markdown("### Detected Segments")
-            render_segment_cards(segments)
-        with col2:
-            st.markdown("### Analytics")
-            render_metrics(segments, total_duration)
-    else:
-        st.warning("No pre-cached results found. Run analysis first or add `demo_results.json`.")
+    warning = None
+    progress.progress(5, text="Reading video...")
+    try:
+        total_duration = get_video_duration(video_path)
+    except Exception:
+        raise PipelineError("Couldn't read this file as a video. Try an .mp4 or .mov export of the clip.")
 
-elif uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp.write(uploaded_file.read())
-        video_path = tmp.name
+    progress.progress(10, text="Extracting audio...")
+    audio_path = video_path.replace(".mp4", "_audio.wav")
+    try:
+        extract_audio(video_path, audio_path)
+    except Exception:
+        raise PipelineError("Couldn't extract an audio track from this video. Check that the clip has sound.")
 
-    st.video(uploaded_file)
-
-    if st.button("🔬 Analyze Video", type="primary", use_container_width=True):
-        from video_processor import get_video_duration, extract_audio, segment_video_clips
-        from audio_analyzer import analyze_full_audio
-
-        progress = st.progress(0, text="Initializing pipeline...")
-
-        try:
-            total_duration = get_video_duration(video_path)
-            st.info(f"Video duration: {format_time(total_duration)}")
-        except Exception as e:
-            st.error(f"Could not read video: {e}")
-            st.stop()
-
-        progress.progress(10, text="Extracting audio...")
-
-        audio_path = video_path.replace(".mp4", "_audio.wav")
-        try:
-            from video_processor import extract_audio
-            extract_audio(video_path, audio_path)
-        except Exception as e:
-            st.error(f"Audio extraction failed: {e}")
-            st.stop()
-
-        progress.progress(30, text="Analyzing audio features (librosa)...")
-
+    try:
+        progress.progress(30, text="Analysing audio features (librosa)...")
         skip_merge = mode_key in ("vlm", "hybrid")
         try:
             audio_segments = analyze_full_audio(
@@ -460,7 +653,7 @@ elif uploaded_file is not None:
                 merge=not skip_merge
             )
         except Exception as e:
-            st.error(f"Audio analysis failed: {e}")
+            warning = f"Audio analysis failed ({type(e).__name__}), so audio signals are missing from this run."
             audio_segments = []
 
         segments = audio_segments
@@ -474,7 +667,7 @@ elif uploaded_file is not None:
 
             for i, clip in enumerate(clips):
                 pct = 50 + int(40 * i / len(clips))
-                progress.progress(pct, text=f"VLM analyzing clip {i+1}/{len(clips)}...")
+                progress.progress(pct, text=f"VLM analysing clip {i + 1} of {len(clips)}...")
 
                 with tempfile.TemporaryDirectory() as frame_dir:
                     try:
@@ -544,84 +737,161 @@ elif uploaded_file is not None:
                         "description": clip.get("vlm_description", ""),
                     })
                 segments = merge_adjacent_segments(segments)
-
-        progress.progress(95, text="Generating timeline...")
-
-        cache_data = {
-            "video_name": uploaded_file.name,
-            "total_duration": total_duration,
-            "analysis_mode": mode_key,
-            "clip_duration": clip_duration,
-            "clip_overlap": clip_overlap,
-            "segments": segments,
-        }
-        cache_path = Path(__file__).parent / "demo_results.json"
-        with open(cache_path, "w") as f:
-            json.dump(cache_data, f, indent=2)
-
-        progress.progress(100, text="Analysis complete!")
-        time.sleep(0.5)
-
-        if segments:
-            render_timeline(segments, total_duration)
-
-            col1, col2 = st.columns([3, 2])
-            with col1:
-                st.markdown("### Detected Segments")
-                render_segment_cards(segments)
-            with col2:
-                st.markdown("### Analytics")
-                render_metrics(segments, total_duration)
-
-            with st.expander("Raw JSON Output (API response format)"):
-                st.json(cache_data)
-        else:
-            st.warning("No segments detected. Try a different clip or analysis mode.")
-
-        try:
-            os.unlink(video_path)
-            if os.path.exists(audio_path):
+    finally:
+        if os.path.exists(audio_path):
+            try:
                 os.unlink(audio_path)
-        except Exception:
-            pass
+            except OSError:
+                pass
 
-else:
-    st.markdown("""
-    <div style="text-align:center;padding:60px 20px;background:#1e293b;border-radius:12px;margin:20px 0;">
-        <div style="font-size:48px;margin-bottom:16px;">🎬</div>
-        <h3 style="color:#e2e8f0;margin-bottom:8px;">Upload a video clip to begin</h3>
-        <p style="color:#94a3b8;font-size:14px;max-width:500px;margin:0 auto;">
-            A simplified prototype of the JioTV+ Xtras contextual overlay — detecting song
-            sequences, action scenes, dialogue, and credits in video content using
-            multi-modal AI (audio analysis + vision language models).
-        </p>
-        <div style="margin-top:24px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
-            <div style="background:#1a1a2e;padding:8px 16px;border-radius:6px;font-size:12px;color:#94a3b8;">
-                💡 Tip: Use a 1-5 minute clip for best results
-            </div>
-            <div style="background:#1a1a2e;padding:8px 16px;border-radius:6px;font-size:12px;color:#94a3b8;">
-                🎵 Songs with choreography are easiest to detect
-            </div>
-            <div style="background:#1a1a2e;padding:8px 16px;border-radius:6px;font-size:12px;color:#94a3b8;">
-                ⚡ Action scenes with high energy are well-classified
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    progress.progress(95, text="Building the timeline...")
+    result = {
+        "video_name": video_name,
+        "total_duration": total_duration,
+        "analysis_mode": mode_key,
+        "clip_duration": clip_duration,
+        "clip_overlap": clip_overlap,
+        "segments": segments,
+    }
+    progress.progress(100, text="Analysis complete")
+    time.sleep(0.3)
+    return result, warning
 
-    st.markdown("### How It Works")
-    c1, c2, c3, c4 = st.columns(4)
-    steps = [
-        ("1️⃣", "Clip Segmentation", "Split video into 10s clips with 2s overlap for boundary handling"),
-        ("2️⃣", "Audio Analysis", "librosa extracts tempo, harmonic ratio, spectral features, beat strength"),
-        ("3️⃣", "VLM Classification", "Vision model analyzes sampled frames — choreography, combat, conversation"),
-        ("4️⃣", "Fusion + Routing", "Merge signals, assign confidence tiers, route to auto-tag or human review"),
-    ]
-    for col, (num, title, desc) in zip([c1, c2, c3, c4], steps):
-        col.markdown(f"""
-        <div style="background:#1e293b;border-radius:8px;padding:16px;text-align:center;height:180px;">
-            <div style="font-size:28px;margin-bottom:8px;">{num}</div>
-            <div style="font-weight:700;font-size:14px;color:#e2e8f0;margin-bottom:6px;">{title}</div>
-            <div style="font-size:11px;color:#94a3b8;line-height:1.5;">{desc}</div>
-        </div>
-        """, unsafe_allow_html=True)
+
+# --- Page --------------------------------------------------------------------
+
+render_header()
+render_how_it_works()
+
+tab_demo, tab_own = st.tabs(["Demo result", "Analyse your own clip"])
+
+with tab_demo:
+    demo_data = load_precached_results()
+    if demo_data:
+        md(
+            '<div class="xt-note"><strong>Demo run: a 63-second clip stitched from five film songs, '
+            'hybrid mode.</strong>'
+            f'<span class="xt-note-meta">Pre-computed with {demo_data.get("clip_duration", 10)}-second clips and '
+            f'{demo_data.get("clip_overlap", 2)} seconds of overlap, so nothing is processed when the page loads.</span></div>'
+        )
+        render_result(demo_data, is_demo=True)
+    else:
+        st.info("The demo result (demo_results.json) isn't available. Use the other tab to analyse a clip.")
+
+with tab_own:
+    md('<p class="xt-prose">Run the live pipeline on a short clip; 1 to 5 minutes works best. '
+       'The upload is saved to a temporary file and deleted once the analysis finishes.</p>')
+
+    with st.container(border=True):
+        mode_options = ["audio", "vlm", "hybrid"]
+        mode_key = st.radio(
+            "Analysis mode",
+            mode_options,
+            format_func=lambda k: {"audio": "Audio only (librosa)", "vlm": "Vision (VLM via Ollama)",
+                                   "hybrid": "Hybrid: audio + vision"}[k],
+            horizontal=True,
+        )
+        st.caption({
+            "audio": "Reads tempo, beats, harmony and speech-like spectra. Runs anywhere ffmpeg is installed, "
+                     "including this hosted demo. Labels: musical, dialogue, action.",
+            "vlm": "A vision-language model describes sampled frames. Needs a local Ollama server, "
+                   "so it won't run on the hosted demo.",
+            "hybrid": "Both signals, fused per clip. Needs a local Ollama server for the vision half, "
+                      "so it won't run on the hosted demo.",
+        }[mode_key])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            clip_duration = st.slider("Clip length (seconds)", 5, 30, 10,
+                                      help="Length of each analysis window.")
+        with c2:
+            # Overlap must stay below the clip length or the windowing loop never advances.
+            max_overlap = min(5, clip_duration - 1)
+            clip_overlap = st.slider("Overlap (seconds)", 0, max_overlap, min(2, max_overlap),
+                                     help="How much neighbouring windows share, so boundaries aren't missed.")
+
+        vlm_model = None
+        vision_ready = True
+        if mode_key in ("vlm", "hybrid"):
+            available, vision_models = ollama_status()
+            if available and vision_models:
+                vlm_model = st.selectbox("Vision model", vision_models)
+            elif available:
+                vision_ready = False
+                st.warning("Ollama is running but has no vision model. Pull one with `ollama pull moondream`, "
+                           "then reload this page.")
+            else:
+                vision_ready = False
+                st.info("Vision and hybrid modes call a vision-language model on a local Ollama server "
+                        "(localhost:11434), and none is reachable here, which is expected on the hosted demo. "
+                        "To use them, run the app on your machine with `ollama serve` and a vision model "
+                        "(for example `ollama pull moondream`). Audio only works here.")
+
+    ffmpeg_ready = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+    if not ffmpeg_ready:
+        st.warning("This environment has no ffmpeg, which the pipeline needs to read video. Install it "
+                   "(`brew install ffmpeg` or `apt install ffmpeg`) to analyse a clip. The demo result "
+                   "doesn't need it.")
+
+    uploaded_file = st.file_uploader(
+        "Video clip (.mp4, .mov, .avi, .mkv)",
+        type=["mp4", "mov", "avi", "mkv"],
+        help="A short clip from any film. Song-and-dance and action scenes are the easiest to detect.",
+    )
+
+    if uploaded_file is not None:
+        preview_col, _ = st.columns([3, 2])
+        with preview_col:
+            st.video(uploaded_file)
+
+        can_run = ffmpeg_ready and vision_ready
+        run = st.button("Analyse clip", type="primary", disabled=not can_run)
+        if not can_run:
+            st.caption("Analysis is unavailable with the current settings; see the note above.")
+
+        if run:
+            progress = st.progress(0, text="Starting...")
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(uploaded_file.getvalue())
+                video_path = tmp.name
+            try:
+                result, run_warning = run_pipeline(video_path, uploaded_file.name, mode_key, vlm_model,
+                                                   clip_duration, clip_overlap, progress)
+                st.session_state["xt_result"] = result
+                st.session_state["xt_warning"] = run_warning
+            except PipelineError as e:
+                st.session_state.pop("xt_result", None)
+                st.error(str(e))
+            except Exception as e:
+                st.session_state.pop("xt_result", None)
+                st.error(f"The analysis stopped unexpectedly ({type(e).__name__}). Try a shorter clip or "
+                         "Audio only mode.")
+            finally:
+                progress.empty()
+                try:
+                    os.unlink(video_path)
+                except OSError:
+                    pass
+
+        result = st.session_state.get("xt_result")
+        if result and result.get("video_name") == uploaded_file.name:
+            if st.session_state.get("xt_warning"):
+                st.warning(st.session_state["xt_warning"])
+            md(
+                f'<div class="xt-note"><strong>{esc(result["video_name"])}</strong>'
+                f'<span class="xt-note-meta">{format_time(result["total_duration"])} · '
+                f'{MODE_LABELS.get(result["analysis_mode"], result["analysis_mode"])} · '
+                f'{result["clip_duration"]}-second clips, {result["clip_overlap"]} s overlap</span></div>'
+            )
+            render_result(result, is_demo=False)
+            st.download_button(
+                "Download results (JSON)",
+                data=json.dumps(result, indent=2),
+                file_name=f"{Path(result['video_name']).stem}_segments.json",
+                mime="application/json",
+            )
+
+md(
+    '<footer class="xt-footer">A prototype of the detection layer behind JioTV+ Xtras, built by '
+    f'<a href="{SITE_URL}" target="_blank" rel="noopener">Akhil S</a>.</footer>'
+)
