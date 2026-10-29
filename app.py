@@ -209,6 +209,28 @@ CSS = """
 .xt .xt-prose + .xt-prose { margin-top: 10px; }
 .xt .xt-kicker { font-size: .72rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--xt-muted); margin: 14px 0 8px; }
 
+.xt .xt-try { margin: 26px 0 10px; }
+.xt .xt-try .xt-h { margin: 0; }
+.xt .xt-try .xt-sub { margin: 4px 0 0; }
+
+/* The two ways in (demo or your own clip) are big buttons, not quiet tab labels, so the
+   live pipeline is as easy to find as the demo. Unselected "own clip" stays outlined in the accent. */
+.stTabs [role="tablist"] { gap: 12px; padding: 0; border: 0; box-shadow: none; margin-bottom: 18px; }
+.stTabs [role="tablist"]::after, .stTabs .react-aria-SelectionIndicator, .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
+.stTabs [role="tab"] {
+  flex: 1 1 0; height: auto; min-height: 60px; margin: 0; padding: 12px 18px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--xt-rule-strong); border-radius: 12px; background: var(--xt-surface);
+  color: var(--xt-ink-2); transition: background .15s, border-color .15s, color .15s;
+}
+.stTabs [role="tab"] p { font-size: 1.05rem; font-weight: 600; color: inherit; white-space: normal; text-align: center; }
+.stTabs [role="tab"] span[role="img"], .stTabs [role="tab"] [data-testid="stIconMaterial"] { color: inherit; font-size: 1.35rem; vertical-align: -0.28em; }
+.stTabs [role="tab"]:nth-of-type(2) { border-color: var(--xt-accent); color: var(--xt-accent); }
+.stTabs [role="tab"]:hover { border-color: var(--xt-accent); color: var(--xt-accent); background: var(--xt-human-bg); }
+.stTabs [role="tab"][aria-selected="true"],
+.stTabs [role="tab"][aria-selected="true"]:hover { background: var(--xt-accent); border-color: var(--xt-accent); color: #fff; }
+.stTabs [role="tab"]:focus-visible { outline: 2px solid var(--xt-accent); outline-offset: 2px; }
+
 .xt-footer { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--xt-rule); font-size: .85rem; color: var(--xt-muted); }
 
 @media (max-width: 720px) {
@@ -763,7 +785,10 @@ def run_pipeline(video_path: str, video_name: str, mode_key: str, vlm_model, cli
 render_header()
 render_how_it_works()
 
-tab_demo, tab_own = st.tabs(["Demo result", "Analyse your own clip"])
+md('<div class="xt-try"><p class="xt-h">Try it</p>'
+   '<p class="xt-sub">See a finished run on a film clip, or upload your own and run the pipeline live.</p></div>')
+
+tab_demo, tab_own = st.tabs([":material/play_circle: See the demo result", ":material/upload: Analyse your own clip"])
 
 with tab_demo:
     demo_data = load_precached_results()
@@ -776,7 +801,7 @@ with tab_demo:
         )
         render_result(demo_data, is_demo=True)
     else:
-        st.info("The demo result (demo_results.json) isn't available. Use the other tab to analyse a clip.")
+        st.info("The demo result (demo_results.json) isn't available. Use “Analyse your own clip” above to run one.")
 
 with tab_own:
     md('<p class="xt-prose">Run the live pipeline on a short clip; 1 to 5 minutes works best. '
